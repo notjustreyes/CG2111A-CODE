@@ -1,0 +1,271 @@
+#include "arm.h"
+#include "movement.h"
+#include "shared_state.h"
+#include "packets.h"
+#include "serial_driver.h"
+#include <stdio.h>
+
+const uint16_t MIN_PULSE_TICKS = 1000; //set to 2000 for simulation
+const uint16_t MAX_PULSE_TICKS = 5000; //set to 4000 for simulation
+const uint16_t TOTAL_TICKS = 40000;
+
+const int NUM_SERVOS = 4;
+const int MIN_ANGLE = 0;
+const int MAX_ANGLE = 180;
+
+// FIX 1: Removed the incorrect integer-division-based STEP_SIZE constant.
+// Previously: ((MAX_PULSE_TICKS - MIN_PULSE_TICKS) / (MAX_ANGLE - MIN_ANGLE)) + 1 = 23
+// This caused up to ~1 degree of jerk on the final step of every move due to
+// accumulated integer rounding. STEP_SIZE is now a plain tunable constant (16 ticks),
+// which is just under one degree and gives smooth, consistent stepping.
+const int STEP_SIZE = 16;
+
+volatile uint16_t currTicks = 0;
+int msPerDeg = 10; //initial speed
+
+
+const Servo Servos[NUM_SERVOS] = {
+  [BASE] = {.ddr=&DDRK, .port=&PORTK, .pin=PK4, .metadata={.minAngle=0, .maxAngle=180, .initAngle=90, .homeAngle=90}},
+  [SHOULDER] = {.ddr=&DDRK, .port=&PORTK, .pin=PK5, .metadata={.minAngle=0, .maxAngle=180, .initAngle=80, .homeAngle=80}},
+  [ELBOW] = {.ddr=&DDRK, .port=&PORTK, .pin=PK6, .metadata={.minAngle=0, .maxAngle=180, .initAngle=90, .homeAngle=90}},
+  [GRIPPER] = {.ddr=&DDRK, .port=&PORTK, .pin=PK7, .metadata={.minAngle=70, .maxAngle=80, .initAngle=80, .homeAngle=80}}
+};
+
+// FIX 2 (part a): Added a shadow double-buffer for pulseWidths.
+// The ISR reads pulseWidths[] directly. On AVR (8-bit CPU), a uint16_t read/write
+// is two separate instructions, so the ISR could fire between them and read a
+// torn/corrupt value — causing random servo misbehavior unrelated to any specific angle.
+// Solution: main code writes to pulseWidths[] as before (with cli/sei guards),
+// and at the START of each new 20ms period (when all pins are already low and safe),
+// the ISR atomically copies pulseWidths[] into isrPulseWidths[] before using them.
+// The ISR only ever reads isrPulseWidths[], eliminating the torn-read hazard.
+volatile uint16_t pulseWidths[NUM_SERVOS];
+volatile uint16_t targetPulseWidths[NUM_SERVOS];
+static volatile uint16_t isrPulseWidths[NUM_SERVOS]; // ISR-private shadow copy
+
+
+const char* servoTypeToString(ServoType type) {
+  switch (type) {
+    case BASE: return "b";
+    case SHOULDER: return "s";
+    case ELBOW: return "e";
+    case GRIPPER: return "g";
+    default: return "u";
+  }
+}
+
+
+int parse3(const String *s) {
+  if (!s) return -1;
+  if (s->length() != 3) return -1;
+  if (!isDigit(s->charAt(0)) || !isDigit(s->charAt(1)) || !isDigit(s->charAt(2))) return -1;
+  return (s->charAt(0) - '0') * 100 + (s->charAt(1) - '0') * 10 + (s->charAt(2) - '0');
+}
+
+void changeServoAngle(int targetAngle, ServoType servoType) {
+  targetAngle = constrain(targetAngle, Servos[servoType].metadata.minAngle, Servos[servoType].metadata.maxAngle);
+  int target = angleToPulseWidth(targetAngle);
+  changeTargetPulseWidth(target, servoType);
+}
+
+//gripper methods
+void closeGripper() {
+  changeServoAngle(Servos[GRIPPER].metadata.maxAngle, GRIPPER);
+}
+
+void openGripper() {
+  changeServoAngle(Servos[GRIPPER].metadata.minAngle, GRIPPER);
+}
+
+// FIX 3: Replaced Arduino map() with precise integer arithmetic.
+// map() uses the same integer division as before and accumulates rounding error
+// across the 0–180 degree range. The new formula uses 32-bit intermediate math
+// to stay exact: result = MIN + (angle * range) / MAX_ANGLE, with no truncation
+// until the final cast. This eliminates the "magic angle" jerk caused by two
+// servos landing on the same or adjacent tick value due to rounding collisions.
+int angleToPulseWidth(int angle) {
+  return (int)(MIN_PULSE_TICKS + ((int32_t)(angle - MIN_ANGLE) * (MAX_PULSE_TICKS - MIN_PULSE_TICKS)) / (MAX_ANGLE - MIN_ANGLE));
+}
+
+void homeAll() {
+  for (int i=0;i<NUM_SERVOS;i++) {
+    cli();
+    targetPulseWidths[i] = angleToPulseWidth(Servos[i].metadata.homeAngle);
+    sei();
+  }
+}
+
+void homeNoGripper() {
+  cli();
+  targetPulseWidths[BASE] = angleToPulseWidth(Servos[BASE].metadata.homeAngle);
+  targetPulseWidths[SHOULDER] = angleToPulseWidth(Servos[SHOULDER].metadata.homeAngle);
+  targetPulseWidths[ELBOW] = angleToPulseWidth(Servos[ELBOW].metadata.homeAngle);
+  sei();
+}
+
+void changeTargetPulseWidth(int newPulseWidth, ServoType servoType) {
+  cli();
+  targetPulseWidths[servoType] = newPulseWidth;
+  sei();
+}
+
+void updatePulseWidth(ServoType servoType) {
+  cli();
+  int32_t target = targetPulseWidths[servoType];
+  int32_t curr = pulseWidths[servoType];
+  sei();
+  int32_t next;
+  int dir;
+  if (target == curr) {
+    return;
+  } else {
+    dir = (target > curr) ? 1 : -1;
+    if (abs(target - curr) < STEP_SIZE) {
+      next = target;
+    } else {
+      next = ((int32_t)curr) + dir * STEP_SIZE;
+    }
+  }
+  int32_t minTicks = angleToPulseWidth(Servos[servoType].metadata.minAngle);
+  int32_t maxTicks = angleToPulseWidth(Servos[servoType].metadata.maxAngle);
+
+  if (next < minTicks) next = minTicks;
+  if (next > maxTicks) next = maxTicks;
+
+  cli();
+  pulseWidths[servoType] = (uint16_t) next;
+  sei();
+}
+
+//methods to set pulse
+void setSinglePulseLow(Servo sv) {
+  *sv.port &= ~(1 << sv.pin);
+}
+
+void setSinglePulseLow(int i) {
+  Servo sv = Servos[i];
+  setSinglePulseLow(sv);
+}
+
+void setSinglePulseLow(ServoType servoType) {
+  Servo sv = Servos[servoType];
+  setSinglePulseLow(sv);
+}
+
+void setAllPulseLow() {
+  for (Servo sv : Servos) {
+    setSinglePulseLow(sv);
+  }
+}
+
+void setSinglePulseHigh(Servo sv) {
+  *sv.port |= (1 << sv.pin);
+}
+
+void setSinglePulseHigh(int i) {
+  Servo sv = Servos[i];
+  setSinglePulseHigh(sv);
+}
+
+void setSinglePulseHigh(ServoType servoType) {
+  Servo sv = Servos[servoType];
+  setSinglePulseHigh(sv);
+}
+
+void setAllPulseHigh() {
+  for (Servo sv : Servos) {
+    setSinglePulseHigh(sv);
+  }
+}
+
+//ISR
+ISR(TIMER5_COMPA_vect) {
+  uint16_t currOcr = OCR5A;
+  currTicks += currOcr;
+  uint16_t nextAbs = TOTAL_TICKS;
+  uint16_t pulseWidth;
+  if (currTicks >= TOTAL_TICKS) {
+    setAllPulseLow(); //safety
+    currTicks = 0;
+
+    // FIX 2 (part b): Snapshot pulseWidths into isrPulseWidths here, at the
+    // start of the new 20ms period, while all pins are already low and safe.
+    // This is the only point where it is safe to do so — no pulse is active,
+    // so a mid-snapshot inconsistency cannot cause a pin to stay high too long.
+    // From here on the ISR uses only isrPulseWidths[], never pulseWidths[] directly.
+    for (int i = 0; i < NUM_SERVOS; i++) {
+      isrPulseWidths[i] = pulseWidths[i];
+    }
+
+    setAllPulseHigh();
+    for (int i=0;i<NUM_SERVOS;i++) {
+      pulseWidth = isrPulseWidths[i]; // FIX 2: use shadow copy
+      if (pulseWidth < nextAbs) {
+        nextAbs = pulseWidth;
+      }
+    }
+  } else {
+    for (int i=0;i<NUM_SERVOS;i++) {
+      pulseWidth = isrPulseWidths[i]; // FIX 2: use shadow copy
+      // FIX 4: Removed the redundant "pulseWidth > currTicks" guard in the
+      // else-if branch. It was logically impossible for it to be false here
+      // (we just checked pulseWidth <= currTicks in the if-branch above),
+      // but more importantly it created an ambiguous dead zone when two servos
+      // had the same pulse width: the second servo would fall into neither branch
+      // and never have its pin driven low, causing it to hold high for the full
+      // 20ms period and snap to maximum position — the "magic angle" jerk.
+      if (pulseWidth <= currTicks) {
+        setSinglePulseLow(i);
+      } else if (pulseWidth < nextAbs) {
+        nextAbs = pulseWidth;
+      }
+    }
+  }
+  int delta = nextAbs - currTicks;
+  if (delta == 0) {
+    delta = 1;
+  }
+  OCR5A = delta;
+}
+
+//initialisation methods
+void initPulseArrays() {
+  for (int i=0;i<NUM_SERVOS;i++) {
+    pulseWidths[i] = angleToPulseWidth(Servos[i].metadata.initAngle);
+    targetPulseWidths[i] = angleToPulseWidth(Servos[i].metadata.initAngle);
+    isrPulseWidths[i] = pulseWidths[i]; // initialise shadow copy too
+  }
+}
+
+int initOcr1aVal() {
+  int val = TOTAL_TICKS;
+  for (int pulseWidth : pulseWidths) {
+    if (pulseWidth < val) {
+      val = pulseWidth;
+    }
+  }
+  return val;
+}
+
+void initPulse() {
+  for (int i=0;i<NUM_SERVOS;i++) {
+    *(Servos[i].ddr) |= (1 << Servos[i].pin);
+  }
+  TCNT5 = 0;
+  OCR5A = initOcr1aVal();
+  TCCR5A = 0b0;
+  TIMSK5 = (1 << OCIE5A);
+}
+
+void startPulse() {
+  setAllPulseHigh();
+  TCCR5B = 0b00001010;
+}
+
+//method that moves servos
+void updateAllServos() {
+  for (int i=0;i<NUM_SERVOS;i++) {
+    updatePulseWidth(static_cast<ServoType>(i));
+  }
+  delay(msPerDeg);
+}

@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""
+Studio 16: Robot Integration
+second_terminal.py  -  Second operator terminal.
+
+This terminal connects to pi_sensor.py over TCP.  It:
+  - Displays every TPacket forwarded from the robot (via pi_sensor.py).
+  - Sends a software E-Stop command when you type 'e'.
+
+Architecture
+------------
+   [Arduino] <--USB serial--> [pi_sensor.py] <--TCP--> [second_terminal.py]
+                                (TCP server,               (TCP client,
+                                 port 65432)                localhost:65432)
+
+Run pi_sensor.py FIRST (it starts the TCP server), then run this script.
+Both scripts run on the same Raspberry Pi.
+
+IMPORTANT: Update the TPacket constants below to match your pi_sensor.py.
+---------------------------------------------------------------------------
+The packet constants (PACKET_TYPE_*, COMMAND_*, RESP_*, STATE_*, sizes) are
+duplicated here from pi_sensor.py.  They MUST stay in sync with your
+pi_sensor.py (and with the Arduino sketch).  Update them whenever you change
+your protocol.
+
+Tip: consider abstracting all TPacket constants into a shared file (e.g.
+packets.py) that both pi_sensor.py and second_terminal.py import, so there
+is only one place to update them.  You do not have to do this now, but it
+avoids hard-to-find bugs caused by constants getting out of sync.
+
+Commands
+--------
+  e   Send a software E-Stop to the robot (same as pressing the button).
+  q   Quit.
+
+Usage
+-----
+    source env/bin/activate
+    python3 second_terminal/second_terminal.py
+
+Press Ctrl+C to exit.
+"""
+
+import select
+import struct
+import sys
+import time
+from second_terminal_config import *
+from constants import *
+
+# net_utils is imported with an absolute import because this script is designed
+# to be run directly (python3 second_terminal/second_terminal.py), which adds
+# this file's directory to sys.path automatically.
+from net_utils import TCPClient, sendTPacketFrame, recvTPacketFrame
+
+#global vars
+base_angle = INIT_BASE_ANGLE
+shoulder_angle = INIT_SHOULDER_ANGLE
+elbow_angle = INIT_ELBOW_ANGLE
+gripper_angle = INIT_GRIPPER_ANGLE
+
+# ---------------------------------------------------------------------------
+# Connection settings
+# ---------------------------------------------------------------------------
+# Both scripts run on the same Pi, so the host is 'localhost'.
+# Change PI_HOST to the Pi's IP address if you run this from a different machine.
+PI_HOST = 'localhost'
+PI_PORT = 65432
+isColourForever = False
+sendNextColourForever = True
+
+# ---------------------------------------------------------------------------
+# TPacket constants
+# ---------------------------------------------------------------------------
+# IMPORTANT: keep these in sync with your pi_sensor.py and the Arduino sketch.
+
+
+MAX_STR_LEN  = 32
+PARAMS_COUNT = 16
+
+TPACKET_SIZE = 1 + 1 + 2 + MAX_STR_LEN + (PARAMS_COUNT * 4)  # = 100
+TPACKET_FMT  = f'<BB2x{MAX_STR_LEN}s{PARAMS_COUNT}I'
+
+# ----------------------------------------------------------------
+# RELIABLE FRAMING: magic number + XOR checksum
+# ----------------------------------------------------------------
+
+MAGIC = b'\xDE\xAD'          # 2-byte magic number (0xDEAD)
+FRAME_SIZE = len(MAGIC) + TPACKET_SIZE + 1   # 2 + 100 + 1 = 103
+
+# ---------------------------------------------------------------------------
+# TPacket helpers
+# ---------------------------------------------------------------------------
+
+def _computeChecksum(data: bytes) -> int:
+    result = 0
+    for b in data:
+        result ^= b
+    return result
+
+
+def _packFrame(packetType, command, data=b'', params=None):
+    """Pack a TPacket into a 103-byte framed byte string."""
+    if params is None:
+        params = [0] * PARAMS_COUNT
+    data_padded  = (data + b'\x00' * MAX_STR_LEN)[:MAX_STR_LEN]
+    packet_bytes = struct.pack(TPACKET_FMT, packetType, command,
+                               data_padded, *params)
+    return MAGIC + packet_bytes + bytes([_computeChecksum(packet_bytes)])
+
+
+def _unpackFrame(frame: bytes):
+    """Validate checksum and unpack a 103-byte frame.  Returns None if corrupt."""
+    if len(frame) != FRAME_SIZE or frame[:2] != MAGIC:
+        return None
+    raw = frame[2:2 + TPACKET_SIZE]
+    if frame[-1] != _computeChecksum(raw):
+        return None
+    fields = struct.unpack(TPACKET_FMT, raw)
+    return {
+        'packetType': fields[0],
+        'command':    fields[1],
+        'data':       fields[2],
+        'params':     list(fields[3:]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Packet display
+# ---------------------------------------------------------------------------
+
+_estop_active = False
+
+
+def _printPacket(pkt):
+    """Pretty-print a TPacket forwarded from the robot."""
+    global _estop_active
+
+    ptype = pkt['packetType']
+    cmd   = pkt['command']
+
+    if ptype == PACKET_TYPE_RESPONSE:
+        if cmd == RESP_OK:
+            print("[robot] OK")
+        elif cmd == RESP_STATUS:
+            state         = pkt['params'][0]
+            _estop_active = (state == STATE_STOPPED)
+            print(f"[robot] Status: {'STOPPED' if _estop_active else 'RUNNING'}")
+        elif cmd == RESP_COLOUR:
+            r_freq = pkt['params'][0]
+            g_freq = pkt['params'][1]
+            b_freq = pkt['params'][2]
+            if r_freq - b_freq > COLOUR_DIFF_THRESHOLD and r_freq - g_freq > COLOUR_DIFF_THRESHOLD:
+                print(f"DETECT RED: R:{r_freq} G:{g_freq} B:{b_freq}")
+            if b_freq - r_freq > COLOUR_DIFF_THRESHOLD and b_freq - g_freq > COLOUR_DIFF_THRESHOLD:
+                print(f"DETECT BLUE: R:{r_freq} G:{g_freq} B:{b_freq}")
+            if g_freq - r_freq > COLOUR_DIFF_THRESHOLD and g_freq - b_freq > COLOUR_DIFF_THRESHOLD:
+                print(f"DETECT GREEN: R:{r_freq} G:{g_freq} B:{b_freq}")
+            colour = f"R:{r_freq} G:{g_freq} B:{b_freq}"
+            sys.stdout.write("\r" + colour + "      ")
+            sys.stdout.flush()
+            return True
+            # r_freq = pkt['params'][0]
+            # g_freq = pkt['params'][1]
+            # b_freq = pkt['params'][2]
+            # colour = f"Colour Response: R: {r_freq} Hz, G: {g_freq} Hz, B: {b_freq} Hz"
+            # #print(colour)
+            # sys.stdout.write("\r" + colour + "   ")
+            # sys.stdout.flush()
+            # return True
+            # print(f"Colour Response: R: {r_freq} Hz, G: {g_freq} Hz, B: {b_freq} Hz")
+            
+            # return True
+        # elif cmd == RESP_COLOUR_FOREVER:
+        #     r_freq = pkt['params'][0]
+        #     g_freq = pkt['params'][1]
+        #     b_freq = pkt['params'][2]
+        #     colour = f"Red: {r_freq}  Green: {g_freq}  Blue: {b_freq}"   
+        #     print(colour)
+            # sys.stdout.write("\r" + colour + "   ")
+            # sys.stdout.flush()
+            # print("hi")
+            #return True
+        else:
+            print(f"[robot] Response: unknown command {cmd}")
+        # Print any debug string embedded in the data field.
+        debug = pkt['data'].rstrip(b'\x00').decode('ascii', errors='replace')
+        if debug:
+            print(f"[robot] Debug: {debug}")
+
+    elif ptype == PACKET_TYPE_MESSAGE and cmd not in [COMMAND_FRONT, COMMAND_BACK, COMMAND_CCW, COMMAND_CW, COMMAND_MOVE_STOP]:
+        msg = pkt['data'].rstrip(b'\x00').decode('ascii', errors='replace')
+        print(f"[robot] Message: {msg}")
+
+    else:
+        print(f"[robot] Packet: type={ptype}, cmd={cmd}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Input handling
+# ---------------------------------------------------------------------------
+
+def _handleInput(line: str, client: TCPClient):
+    global isColourForever
+    global sendNextColourForever
+    global base_angle
+    global shoulder_angle
+    global elbow_angle
+    global gripper_angle
+    """Handle one line of keyboard input."""
+    line = line.strip().lower()
+    if not line:
+        return
+
+    if line == 'e':
+        frame = _packFrame(PACKET_TYPE_COMMAND, COMMAND_ESTOP)
+        sendTPacketFrame(client.sock, frame)
+        print("[second_terminal] Sent: E-STOP")
+
+    elif line == 'q':
+        print("[second_terminal] Quitting.")
+        raise KeyboardInterrupt
+    
+    elif line == 'h':
+        s = f"""
+previous angles:
+{base_angle=}
+{shoulder_angle=}
+{elbow_angle=}
+{gripper_angle=}
+"""
+        print(s)
+        frame = _packFrame(PACKET_TYPE_COMMAND, COMMAND_ARM_HOME)
+        sendTPacketFrame(client.sock, frame)
+        base_angle = HOME_BASE_ANGLE
+        shoulder_angle = HOME_SHOULDER_ANGLE
+        elbow_angle = HOME_ELBOW_ANGLE
+        print("[second_terminal] Sent: Home servos")
+
+    
+    elif line == 'home':
+        frame = _packFrame(PACKET_TYPE_COMMAND, COMMAND_ARM_HOME_ALL)
+        sendTPacketFrame(client.sock, frame)
+        base_angle = HOME_BASE_ANGLE
+        shoulder_angle = HOME_SHOULDER_ANGLE
+        elbow_angle = HOME_ELBOW_ANGLE
+        gripper_angle = HOME_GRIPPER_ANGLE
+        print("[second_terminal] Sent: Home ALL servos")
+        s = f"""
+previous angles:
+{base_angle=}
+{shoulder_angle=}
+{elbow_angle=}
+{gripper_angle=}
+"""
+        print(s)
+    
+    elif line[0] in ['b', 's', 'e', 'g'] and len(line) == 4 and is_int(line[1:]):
+        angle = int(line[1:])
+        if line[0] == 'b':
+            servo_type = BASE
+            base_angle = angle
+        elif line[0] == 's':
+            servo_type = SHOULDER
+            shoulder_angle = angle
+        elif line[0] == 'e':
+            servo_type = ELBOW
+            elbow_angle = angle
+        elif line[0] == 'g':
+            servo_type = GRIPPER
+            gripper_angle = angle
+        else:
+            raise ValueError("_handleInput incorrectly entered elif line[0] in ['B', 'S', 'E', 'G'] and len(line) == 4 and is_int(line[1:]) branch")
+        
+
+        params = [0] * PARAMS_COUNT
+        params[0] = servo_type
+        params[1] = angle
+
+        frame = _packFrame(PACKET_TYPE_COMMAND, COMMAND_ARM_ANGLE, params=params)
+        sendTPacketFrame(client.sock, frame)
+        print(f"[second_terminal] Sent: arm servo {servo_type} set to angle " + line[1:])
+    elif line == 'gc':
+        params = [0] * PARAMS_COUNT
+        params[0] = GRIPPER
+        params[1] = GRIPPER_CLOSE_ANGLE
+        frame = _packFrame(PACKET_TYPE_COMMAND, COMMAND_ARM_ANGLE, params=params)
+        sendTPacketFrame(client.sock, frame)
+        gripper_angle = 80
+        print(f"[second_terminal] Sent: close gripper")
+    elif line == 'go':
+        params = [0] * PARAMS_COUNT
+        params[0] = GRIPPER
+        params[1] = GRIPPER_OPEN_ANGLE
+        frame = _packFrame(PACKET_TYPE_COMMAND, COMMAND_ARM_ANGLE, params=params)
+        sendTPacketFrame(client.sock, frame)
+        gripper_angle = 70
+        print(f"[second_terminal] Sent: open gripper")
+
+    elif line == 'c':
+        frame = _packFrame(PACKET_TYPE_COMMAND, COMMAND_COLOUR)
+        sendTPacketFrame(client.sock, frame)
+    elif line == 'cf':
+        isColourForever = True
+        sendNextColourForever = True
+        print("continuous colour sensor mode ON")
+    
+    elif line == 'sc':
+        isColourForever = False
+        sendNextColourForever = True
+        print("continuous colour sensor mode OFF")
+    elif line == 'i':
+        s = f"""
+{base_angle=}
+{shoulder_angle=}
+{elbow_angle=}
+{gripper_angle=}
+"""
+        print(s)
+
+
+    
+
+        
+        
+            
+        
+
+
+    else:
+        print(f"[second_terminal] Unknown: '{line}'.  Valid: e (E-Stop)  q (quit)")
+
+def is_int(i: int) -> bool:
+    try:
+        int(i)
+        return True
+    except ValueError:
+        return False
+    
+def _exitInput(line):
+    if line == 'q':
+        return True
+    else:
+        return False
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run():
+    global isColourForever
+    global sendNextColourForever
+    client = TCPClient(host=PI_HOST, port=PI_PORT)
+    print(f"[second_terminal] Connecting to pi_sensor.py at {PI_HOST}:{PI_PORT}...")
+
+    if not client.connect(timeout=10.0):
+        print("[second_terminal] Could not connect.")
+        print("  Make sure pi_sensor.py is running and waiting for a"
+              " second terminal connection.")
+        sys.exit(1)
+
+    print("[second_terminal] Connected!")
+    print("[second_terminal] Commands:  e = E-Stop   q = quit")
+    print("[second_terminal] Incoming robot packets will be printed below.\n")
+
+    try:
+        
+        while True:
+            # Check for forwarded TPackets from pi_sensor.py (non-blocking).
+            
+            if client.hasData():
+                frame = recvTPacketFrame(client.sock)
+                if frame is None:
+                    print("[second_terminal] Connection to pi_sensor.py closed.")
+                    break
+                pkt = _unpackFrame(frame)
+                if pkt:
+                    if (_printPacket(pkt)):
+                        sendNextColourForever = True
+                    
+
+                    
+                        # Check for keyboard input (non-blocking via select).
+            rlist, _, _ = select.select([sys.stdin], [], [], 0)
+            if rlist:
+                line = sys.stdin.readline()
+                _handleInput(line, client)
+
+            if isColourForever and sendNextColourForever:
+                frame = _packFrame(PACKET_TYPE_COMMAND, COMMAND_COLOUR)
+                sendTPacketFrame(client.sock, frame)
+                sendNextColourForever = False
+
+
+            time.sleep(LOOP_SLEEP)
+
+    except KeyboardInterrupt:
+        print("\n[second_terminal] Exiting.")
+    finally:
+        client.close()
+
+
+if __name__ == '__main__':
+    run()
