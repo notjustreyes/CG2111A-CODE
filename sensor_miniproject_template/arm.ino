@@ -64,12 +64,7 @@ void openGripper() {
   changeServoAngle(Servos[GRIPPER].metadata.minAngle, GRIPPER);
 }
 
-// FIX 3: Replaced Arduino map() with precise integer arithmetic.
-// map() uses the same integer division as before and accumulates rounding error
-// across the 0–180 degree range. The new formula uses 32-bit intermediate math
-// to stay exact: result = MIN + (angle * range) / MAX_ANGLE, with no truncation
-// until the final cast. This eliminates the "magic angle" jerk caused by two
-// servos landing on the same or adjacent tick value due to rounding collisions.
+
 int angleToPulseWidth(int angle) {
   return (int)(MIN_PULSE_TICKS + ((int32_t)(angle - MIN_ANGLE) * (MAX_PULSE_TICKS - MIN_PULSE_TICKS)) / (MAX_ANGLE - MIN_ANGLE));
 }
@@ -175,11 +170,7 @@ ISR(TIMER5_COMPA_vect) {
     setAllPulseLow(); //safety
     currTicks = 0;
 
-    // FIX 2 (part b): Snapshot pulseWidths into isrPulseWidths here, at the
-    // start of the new 20ms period, while all pins are already low and safe.
-    // This is the only point where it is safe to do so — no pulse is active,
-    // so a mid-snapshot inconsistency cannot cause a pin to stay high too long.
-    // From here on the ISR uses only isrPulseWidths[], never pulseWidths[] directly.
+
     for (int i = 0; i < NUM_SERVOS; i++) {
       isrPulseWidths[i] = pulseWidths[i];
     }
@@ -194,13 +185,7 @@ ISR(TIMER5_COMPA_vect) {
   } else {
     for (int i=0;i<NUM_SERVOS;i++) {
       pulseWidth = isrPulseWidths[i]; // FIX 2: use shadow copy
-      // FIX 4: Removed the redundant "pulseWidth > currTicks" guard in the
-      // else-if branch. It was logically impossible for it to be false here
-      // (we just checked pulseWidth <= currTicks in the if-branch above),
-      // but more importantly it created an ambiguous dead zone when two servos
-      // had the same pulse width: the second servo would fall into neither branch
-      // and never have its pin driven low, causing it to hold high for the full
-      // 20ms period and snap to maximum position — the "magic angle" jerk.
+
       if (pulseWidth <= currTicks) {
         setSinglePulseLow(i);
       } else if (pulseWidth < nextAbs) {
