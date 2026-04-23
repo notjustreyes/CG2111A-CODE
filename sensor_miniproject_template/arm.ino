@@ -13,11 +13,6 @@ const int NUM_SERVOS = 4;
 const int MIN_ANGLE = 0;
 const int MAX_ANGLE = 180;
 
-// FIX 1: Removed the incorrect integer-division-based STEP_SIZE constant.
-// Previously: ((MAX_PULSE_TICKS - MIN_PULSE_TICKS) / (MAX_ANGLE - MIN_ANGLE)) + 1 = 23
-// This caused up to ~1 degree of jerk on the final step of every move due to
-// accumulated integer rounding. STEP_SIZE is now a plain tunable constant (16 ticks),
-// which is just under one degree and gives smooth, consistent stepping.
 const int STEP_SIZE = 16;
 
 volatile uint16_t currTicks = 0;
@@ -31,14 +26,6 @@ const Servo Servos[NUM_SERVOS] = {
   [GRIPPER] = {.ddr=&DDRK, .port=&PORTK, .pin=PK7, .metadata={.minAngle=70, .maxAngle=80, .initAngle=80, .homeAngle=80}}
 };
 
-// FIX 2 (part a): Added a shadow double-buffer for pulseWidths.
-// The ISR reads pulseWidths[] directly. On AVR (8-bit CPU), a uint16_t read/write
-// is two separate instructions, so the ISR could fire between them and read a
-// torn/corrupt value — causing random servo misbehavior unrelated to any specific angle.
-// Solution: main code writes to pulseWidths[] as before (with cli/sei guards),
-// and at the START of each new 20ms period (when all pins are already low and safe),
-// the ISR atomically copies pulseWidths[] into isrPulseWidths[] before using them.
-// The ISR only ever reads isrPulseWidths[], eliminating the torn-read hazard.
 volatile uint16_t pulseWidths[NUM_SERVOS];
 volatile uint16_t targetPulseWidths[NUM_SERVOS];
 static volatile uint16_t isrPulseWidths[NUM_SERVOS]; // ISR-private shadow copy
